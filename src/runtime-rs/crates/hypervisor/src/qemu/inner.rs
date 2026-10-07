@@ -8,7 +8,7 @@ use super::qmp::Qmp;
 use crate::device::pci_path::PciPath;
 use crate::device::topology::PCIePort;
 use crate::qemu::cmdline_generator::VfioDeviceConfig;
-use crate::qemu::qmp::get_qmp_socket_path;
+use crate::qemu::qmp::{block_node_name, get_qmp_socket_path};
 use crate::{
     device::driver::ProtectionDeviceConfig, hypervisor_persist::HypervisorState, selinux,
     HypervisorConfig, MemoryConfig, VcpuThreadIds, VsockDevice, HYPERVISOR_QEMU, KATA_BLK_DEV_TYPE,
@@ -532,12 +532,11 @@ impl QemuInner {
         // Start the virtual machine by restoring it from a VM template if enabled.
         if self.config.vm_template.boot_from_template {
             if self.config.enable_vm_suspend {
-                self.replay_suspend_devices().await?;
-            }
-            self.boot_from_template()
-                .await
-                .context("boot from template")?;
-            if !self.config.enable_vm_suspend {
+                self.restore_suspend_checkpoint().await?;
+            } else {
+                self.boot_from_template()
+                    .await
+                    .context("boot from template")?;
                 self.resume_vm().context("resume vm")?;
             }
         }
@@ -1387,6 +1386,7 @@ impl QemuInner {
                         physical_sector_size,
                         vmdk.as_ref(),
                         iothread,
+                        self.config.enable_vm_suspend && self.config.vm_template.boot_from_template,
                     )
                     .context("hotplug block device")?;
 

@@ -17,6 +17,8 @@ import sys
 import time
 import uuid
 
+from qemu_suspend_checks import CheckpointAudit
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -40,9 +42,15 @@ def main():
         parser.error("--command-timeout must be positive")
     cid = "kata-suspend-" + uuid.uuid4().hex[:12]
     base = [args.ctr, "--address", args.address, "--namespace", args.namespace]
-    if args.evidence_file:
-        args.evidence_file.write_text(json.dumps(dict(container_id=cid, namespace=args.namespace,
-            address=args.address, runtime=args.runtime, config=args.runtime_config_path)) + "\n")
+    audit = CheckpointAudit(args.runtime_config_path, cid) if args.runtime_config_path else None
+    evidence = dict(container_id=cid, namespace=args.namespace, address=args.address,
+                    runtime=args.runtime, config=args.runtime_config_path, cycles=[])
+
+    def save_evidence():
+        if args.evidence_file:
+            args.evidence_file.write_text(json.dumps(evidence, indent=2) + "\n")
+
+    save_evidence()
 
     def ctr(*command):
         return subprocess.run(base + list(command), input="", text=True,
@@ -89,12 +97,23 @@ def main():
             if state != "RUNNING" or "qemu" not in Path(f"/proc/{pid}/comm").read_text():
                 raise RuntimeError("expected a running task backed by QEMU")
             source = identity(pid)
+            cycle_evidence = dict(cycle=cycle, guest_identity_before=before, count_before=count)
+            evidence["cycles"].append(cycle_evidence)
+            if audit:
+                audit.before_suspend()
             started = time.monotonic_ns()
             ctr("tasks", "pause", cid)
             suspend_ms = (time.monotonic_ns() - started) / 1_000_000
             if task()[1] != "PAUSED" or identity(pid) == source:
                 raise RuntimeError("suspend did not leave a PAUSED task with source QEMU gone")
             print(f"Suspended: {suspend_ms:.3f} ms; source QEMU {pid} exited.", flush=True)
+            if audit:
+                cycle_evidence["save"] = audit.suspended()
+                checkpoint = audit.saved
+                print(f"Checkpoint verified: {checkpoint['magic']} v{checkpoint['version']}; "
+                      f"{checkpoint['size_bytes']} bytes; SHA256 {checkpoint['sha256']}; "
+                      f"{checkpoint['path']} (factory templating disabled)", flush=True)
+            save_evidence()
             if args.no_prompt:
                 time.sleep(2)
             else:
@@ -105,8 +124,16 @@ def main():
             restored_pid, state = task()
             if state != "RUNNING" or identity(restored_pid) is None:
                 raise RuntimeError("resume did not restore a running QEMU task")
+            if audit:
+                cycle_evidence["restore"] = audit.resumed(restored_pid)
+                print("Restore verified: replacement QEMU uses -incoming defer -S; "
+                      "checkpoint unchanged", flush=True)
             time.sleep(2)
             after, new_count = probe()
+            cycle_evidence.update(guest_identity_after=after, count_after=new_count,
+                                  suspend_ms=suspend_ms, resume_ms=resume_ms,
+                                  source_qemu_pid=pid, restored_qemu_pid=restored_pid)
+            save_evidence()
             if before != after or new_count <= count:
                 raise RuntimeError("guest/container identity changed or in-memory counter did not advance")
             print(json.dumps(dict(cycle=cycle, suspend_ms=suspend_ms, resume_ms=resume_ms,
@@ -120,7 +147,11 @@ def main():
             time.sleep(0.1)
         ctr("tasks", "delete", cid)
         ctr("containers", "delete", cid)
-    except BaseException:
+        evidence["passed"] = True
+        save_evidence()
+    except BaseException as error:
+        evidence["error"] = str(error)
+        save_evidence()
         print(f"Left {cid} in namespace {args.namespace} for inspection. "
               "Resume it before kill/delete if it is PAUSED.", file=sys.stderr)
         raise

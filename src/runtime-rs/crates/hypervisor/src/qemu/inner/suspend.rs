@@ -151,19 +151,47 @@ impl QemuInner {
         }
     }
 
-    pub(super) async fn replay_suspend_devices(&mut self) -> Result<()> {
+    pub(super) async fn restore_suspend_checkpoint(&mut self) -> Result<()> {
+        // Recreate devices before loading their state, but only query their
+        // PCI paths after migration restores the bridge bus configuration.
+        // Keep the source paths in the ledger unchanged, including on failure.
         for device in self.suspend_hotplug_devices.clone() {
             let DeviceType::BlockModern(ref block) = device else {
                 bail!("only block devices may be hotplugged with VM suspend");
             };
-            let expected = block.lock().await.config.pci_path.clone();
-            self.hotplug_device(device.clone()).await?;
-            let restored = block.lock().await.config.pci_path.clone();
-            // Restore the ledger even when replay fails so a retry can verify it.
-            block.lock().await.config.pci_path = expected.clone();
             ensure!(
-                expected.is_some() && restored == expected,
-                "restored block device PCI address differs from checkpoint"
+                block.lock().await.config.pci_path.is_some(),
+                "checkpoint block device has no recorded PCI address"
+            );
+            self.hotplug_device(device).await?;
+        }
+        self.boot_from_template()
+            .await
+            .context("load suspended VM checkpoint")?;
+
+        let qmp = self
+            .qmp
+            .as_mut()
+            .context("no QMP for restored PCI validation")?;
+        for device in &self.suspend_hotplug_devices {
+            let DeviceType::BlockModern(block) = device else {
+                bail!("only block devices may be hotplugged with VM suspend");
+            };
+            let (index, expected) = {
+                let block = block.lock().await;
+                (block.config.index, block.config.pci_path.clone())
+            };
+            let node = block_node_name(index);
+            let restored = qmp
+                .get_device_by_qdev_id(&node)
+                .with_context(|| format!("query restored PCI address for {node}"))?;
+            ensure!(
+                expected.as_ref() == Some(&restored),
+                "restored block device {node} PCI address differs from checkpoint: expected {expected:?}, got {restored:?}"
+            );
+            info!(
+                sl!(),
+                "verified restored block device {} PCI path: {}", node, restored
             );
         }
         Ok(())
@@ -312,9 +340,232 @@ impl QemuInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::driver::{BlockConfigModern, BlockDeviceModern};
+    use serde_json::{json, Value};
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
     use std::sync::Mutex as StdMutex;
+
+    // Model query-pci's omission of bridge children before incoming migration
+    // restores PCI_SECONDARY_BUS. Consume JSON as a stream because add-fd's
+    // SCM_RIGHTS message is not newline terminated.
+    fn restore_peer(
+        directory: &Path,
+        initially_loaded: bool,
+        wrong_slot: bool,
+        missing_device: bool,
+    ) -> (Qmp, Arc<StdMutex<Vec<Value>>>) {
+        let listener = UnixListener::bind(directory.join("restore.sock")).unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = requests.clone();
+        std::thread::spawn(move || {
+            let (mut writer, _) = listener.accept().unwrap();
+            writeln!(writer, "{}", json!({"QMP": {"version": {"qemu": {"major": 10, "minor": 1, "micro": 0}, "package": "test"}, "capabilities": []}})).unwrap();
+            let reader = io::BufReader::new(writer.try_clone().unwrap());
+            let mut loaded = initially_loaded;
+            let mut devices = Vec::new();
+            let mut fdset = 0;
+            for request in serde_json::Deserializer::from_reader(reader).into_iter::<Value>() {
+                let Ok(request) = request else { break };
+                recorded.lock().unwrap().push(request.clone());
+                let response = match request["execute"].as_str().unwrap() {
+                    "qmp_capabilities" | "blockdev-add" => json!({}),
+                    "query-fdsets" => json!([]),
+                    "add-fd" => {
+                        fdset += 1;
+                        json!({"fdset-id": fdset, "fd": 100 + fdset})
+                    }
+                    "device_add" => {
+                        let args = &request["arguments"];
+                        assert_eq!(args["bus"], "pci-bridge-0");
+                        let slot = i64::from_str_radix(args["addr"].as_str().unwrap(), 16).unwrap();
+                        assert!(!devices.iter().any(|d: &Value| d["slot"] == slot));
+                        devices.push(json!({
+                            "bus": 1, "slot": slot, "function": 0, "qdev_id": args["id"],
+                            "class_info": {"class": 256}, "id": {"vendor": 6900, "device": 4097},
+                            "irq_pin": 1, "regions": []
+                        }));
+                        json!({})
+                    }
+                    "migrate-incoming" => {
+                        assert_eq!(devices.len(), 2, "both disks must exist before loading");
+                        loaded = true;
+                        json!({})
+                    }
+                    "query-migrate" => json!({"status": "completed"}),
+                    "query-pci" => {
+                        let range = json!({"base": 0, "limit": 0});
+                        let mut bridge = json!({"bus": {
+                            "number": 0, "secondary": if loaded {1} else {0},
+                            "subordinate": if loaded {1} else {0},
+                            "io_range": range, "memory_range": range, "prefetchable_range": range
+                        }});
+                        if loaded {
+                            let mut visible = devices.clone();
+                            if wrong_slot {
+                                visible[0]["slot"] = json!(3);
+                            }
+                            if missing_device {
+                                visible.clear();
+                            }
+                            bridge["devices"] = json!(visible);
+                        }
+                        json!([{"bus": 0, "devices": [{
+                            "bus": 0, "slot": 2, "function": 0, "qdev_id": "pci-bridge-0",
+                            "class_info": {"class": 1540}, "id": {"vendor": 6900, "device": 1},
+                            "irq_pin": 0, "regions": [], "pci_bridge": bridge
+                        }]}])
+                    }
+                    other => panic!("unexpected restore QMP command: {}", other),
+                };
+                if writeln!(
+                    writer,
+                    "{}",
+                    json!({"return": response, "id": request["id"]})
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut qmp = Qmp::new(directory.join("restore.sock").to_str().unwrap()).unwrap();
+        qmp.init_pci_bridges(1);
+        (qmp, requests)
+    }
+
+    fn restore_fixture(directory: &Path, qmp: Qmp) -> QemuInner {
+        let (notify, _) = mpsc::channel(1);
+        let mut vm = QemuInner::new(notify);
+        vm.qmp = Some(qmp);
+        vm.config.enable_vm_suspend = true;
+        vm.config.vm_template.boot_from_template = true;
+        vm.config.vm_template.device_state_path = directory.join("state").to_string_lossy().into();
+        vm.config.blockdev_info.block_device_driver = VIRTIO_BLK_PCI.into();
+        for index in 1..=2 {
+            let path = directory.join(format!("disk-{index}"));
+            fs::write(&path, vec![0u8; 512]).unwrap();
+            vm.suspend_hotplug_devices
+                .push(DeviceType::BlockModern(Arc::new(Mutex::new(
+                    BlockDeviceModern {
+                        config: BlockConfigModern {
+                            index,
+                            path_on_host: path.to_string_lossy().into(),
+                            is_direct: Some(false),
+                            pci_path: Some(
+                                PciPath::try_from(format!("02/0{index}").as_str()).unwrap(),
+                            ),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                ))));
+        }
+        vm
+    }
+
+    #[tokio::test]
+    async fn restore_defers_pci_discovery_until_checkpoint_loaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let (qmp, requests) = restore_peer(directory.path(), false, false, false);
+        let mut vm = restore_fixture(directory.path(), qmp);
+        vm.restore_suspend_checkpoint().await.unwrap();
+        let calls = requests.lock().unwrap();
+        let commands: Vec<_> = calls
+            .iter()
+            .map(|r| r["execute"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                "qmp_capabilities",
+                "query-fdsets",
+                "add-fd",
+                "blockdev-add",
+                "device_add",
+                "add-fd",
+                "blockdev-add",
+                "device_add",
+                "migrate-incoming",
+                "query-migrate",
+                "query-pci",
+                "query-pci",
+            ]
+        );
+        let slots: Vec<_> = calls
+            .iter()
+            .filter(|r| r["execute"] == "device_add")
+            .map(|r| r["arguments"]["addr"].as_str().unwrap())
+            .collect();
+        assert_eq!(slots, ["01", "02"]);
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_wrong_or_missing_pci_path_without_changing_ledger() {
+        for missing in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (qmp, requests) = restore_peer(directory.path(), false, !missing, missing);
+            let mut vm = restore_fixture(directory.path(), qmp);
+            let error = vm.restore_suspend_checkpoint().await.unwrap_err();
+            if missing {
+                assert!(format!("{error:#}").contains("query restored PCI address for drive-1"));
+            } else {
+                assert!(error
+                    .to_string()
+                    .contains("PCI address differs from checkpoint"));
+            }
+            for (i, device) in vm.suspend_hotplug_devices.iter().enumerate() {
+                let DeviceType::BlockModern(block) = device else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    block
+                        .lock()
+                        .await
+                        .config
+                        .pci_path
+                        .as_ref()
+                        .unwrap()
+                        .to_string(),
+                    format!("02/0{}", i + 1)
+                );
+            }
+            assert!(!requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r["execute"] == "cont"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_hotplug_still_discovers_pci_path_immediately() {
+        let directory = tempfile::tempdir().unwrap();
+        let (qmp, requests) = restore_peer(directory.path(), true, false, false);
+        let mut vm = restore_fixture(directory.path(), qmp);
+        vm.config.vm_template.boot_from_template = false;
+        let device = vm.suspend_hotplug_devices[0].clone();
+        let DeviceType::BlockModern(block) = &device else {
+            unreachable!()
+        };
+        block.lock().await.config.pci_path = None;
+        vm.hotplug_device(device.clone()).await.unwrap();
+        assert_eq!(
+            block
+                .lock()
+                .await
+                .config
+                .pci_path
+                .as_ref()
+                .unwrap()
+                .to_string(),
+            "02/01"
+        );
+        assert_eq!(
+            requests.lock().unwrap().last().unwrap()["execute"],
+            "query-pci"
+        );
+    }
 
     // Exercise the actual stop/save/rollback sequence without a KVM guest.
     // This QMP peer writes a fixture, not a valid QEMU migration stream.

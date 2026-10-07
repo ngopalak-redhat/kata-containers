@@ -1252,6 +1252,7 @@ impl Qmp {
         physical_block_size: u32,
         vmdk: Option<&VmdkConfig>,
         iothread: Option<&str>,
+        defer_pci_path: bool,
     ) -> Result<(Option<PciPath>, Option<String>)> {
         // `blockdev-add`
         let node_name = block_node_name(index);
@@ -1539,10 +1540,20 @@ impl Qmp {
                 blkdev_add_args,
             )?;
 
+            // Reserve the slot even when PCI discovery is deferred, so the
+            // next replayed disk cannot reuse it. Before migrate-incoming,
+            // bridge bus numbers are still reset and query-pci omits children.
+            self.record_pci_bridge_slot(&bus, slot, &node_name);
+            if defer_pci_path {
+                info!(
+                    sl!(),
+                    "deferring PCI path lookup for {} until checkpoint load", node_name
+                );
+                return Ok((None, None));
+            }
             let pci_path = self
                 .get_device_by_qdev_id(&node_name)
                 .context("get device by qdev_id failed")?;
-            self.record_pci_bridge_slot(&bus, slot, &node_name);
             info!(
                 sl!(),
                 "hotplug block device return pci path: {:?}", &pci_path
@@ -1842,7 +1853,7 @@ pub fn get_qmp_socket_path(sid: &str) -> String {
 }
 
 /// Generate a blockdev node name based on the given index.
-fn block_node_name(index: u64) -> String {
+pub(super) fn block_node_name(index: u64) -> String {
     format!("drive-{index}")
 }
 

@@ -90,6 +90,39 @@ survive restore. It performs two cycles by default (`--cycles N`), then checks
 normal kill/delete. On failure it leaves the task for inspection. `--no-prompt`
 is available for automated runs.
 
+When `--runtime-config-path` is supplied, the script also verifies a newly
+published QEMU migration checkpoint (`QEVM`, format version 3), records its size
+and SHA256, and checks that the replacement QEMU was launched with
+`-incoming defer -S`. The checkpoint must remain unchanged during resume. These
+checks run outside the timed Pause/Resume RPCs; hashing reads the checkpoint
+into the host page cache, so these runs are functional checks, not cold-cache
+latency benchmarks. Checkpoint inspection requires Python 3.11 or later.
+
+Factory template cloning remains disabled. This experiment reuses `save_vm()`
+and `boot_from_template()` to save and load a private running-VM checkpoint.
+The migration-file header and command line alone do not prove application
+continuity; the workload checks are required too.
+
+For exact comparisons of selected application state, use the stronger test:
+
+```sh
+sudo python3.11 tests/functional/qemu-suspend-state.py \
+  --namespace YOUR_CONTAINERD_NAMESPACE \
+  --runtime YOUR_CONFIGURED_RUST_KATA_RUNTIME \
+  --runtime-config-path /path/to/configuration-qemu-runtime-rs.toml \
+  --image YOUR_LOCAL_IMAGE --snapshotter erofs \
+  --evidence-dir /path/to/new-evidence-directory
+```
+
+This requires `bash` and coreutils in the image. It performs two automatic
+cycles and compares a fresh challenge response from the main process before
+and after each suspend: a random shell variable, command-driven counter, guest
+boot ID, PID/start time, and an unlinked open file's inode, flags and offset.
+The next read must return the next unread line and advance the saved offset
+exactly. It writes the observations and checkpoint evidence to
+`state-proof.json`. It verifies these selected fields, not a byte-for-byte
+comparison of all guest RAM.
+
 For an existing compatible task:
 
 ```sh
@@ -117,8 +150,11 @@ until this is run on the target host.
    disks and reclaimable checkpoint file cache remain; this does not promise
    that all sandbox memory disappears from host accounting immediately.
 4. `QemuInner::restore_vm` starts a new QEMU with `-S -incoming defer`, preserves
-   the vsock CID, replays hotplugged blocks in order and checks their PCI paths.
+   the vsock CID and replays hotplugged blocks in order, reserving each slot.
    `boot_from_template` sends `migrate-incoming` and waits for completion.
+   Only then are the disks' PCI paths checked against the source paths, while
+   the CPUs remain stopped. Before migration restores PCI bridge bus numbers,
+   QEMU's `query-pci` can omit devices behind those bridges.
 5. The manager reapplies host cgroups, updates the exposed QEMU PID, sends QMP
    `cont`, reconnects the agent and sets the task Running. WaitProcess, health
    checks and the OOM subscription reconnect; mutating RPCs and byte streams
@@ -143,5 +179,8 @@ sudo -E cargo test -p hypervisor qemu::inner::suspend::tests -- --ignored
 
 The root-only QMP fixture tests cover successful source termination without an
 exit event, save failure rollback, and retaining the checkpoint when restore
-cannot start. They do not simulate a real QEMU migration stream. The interactive
+cannot start. The unprivileged restore fixtures cover two-disk replay before
+migration, PCI validation after loading, rejecting missing or misplaced disks,
+and preserving ordinary hotplug's immediate PCI lookup. They do not simulate a
+real QEMU migration stream. The interactive
 test above is required to validate actual guest restoration and measure latency.
