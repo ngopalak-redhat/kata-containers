@@ -107,6 +107,14 @@ impl Hypervisor for Qemu {
         inner.save_vm().await
     }
 
+    async fn suspend_vm(&self) -> Result<()> {
+        self.inner.write().await.suspend_vm().await
+    }
+
+    async fn restore_vm(&self) -> Result<()> {
+        self.inner.write().await.restore_vm().await
+    }
+
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {
         let mut inner = self.inner.write().await;
         inner.add_device(device).await

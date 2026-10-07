@@ -13,6 +13,11 @@
 # XXX:   Type: @PROJECT_TYPE@
 
 [hypervisor.qemu]
+# Experimental, single-container checkpoint/restore via containerd pause/resume.
+# See docs/how-to/how-to-use-qemu-suspend.md for prerequisites and limitations.
+enable_vm_suspend = false
+vm_suspend_path = "/var/lib/kata-containers/suspend"
+
 path = "@QEMUPATH@"
 kernel = "@KERNELPATH_QEMU@"
 image = "@IMAGEPATH@"

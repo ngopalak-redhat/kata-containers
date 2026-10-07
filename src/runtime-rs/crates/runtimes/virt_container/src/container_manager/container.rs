@@ -652,6 +652,44 @@ impl Container {
         }
     }
 
+    pub(super) async fn vm_status(&self) -> ProcessStatus {
+        self.inner.read().await.init_process.get_status().await
+    }
+
+    pub(super) async fn validate_vm_suspend(&self) -> Result<()> {
+        let inner = self.inner.read().await;
+        anyhow::ensure!(
+            inner.init_process.get_status().await == ProcessStatus::Running,
+            "VM suspend requires a running container"
+        );
+        anyhow::ensure!(
+            inner.exec_processes.is_empty(),
+            "delete exec sessions before suspending the VM"
+        );
+        anyhow::ensure!(
+            !inner.init_process.terminal
+                && inner.init_process.passfd_io.is_none()
+                && [
+                    &inner.init_process.stdin,
+                    &inner.init_process.stdout,
+                    &inner.init_process.stderr
+                ]
+                .iter()
+                .all(|s| s.as_deref().unwrap_or_default().is_empty()),
+            "VM suspend requires a detached container with --null-io"
+        );
+        Ok(())
+    }
+
+    pub(super) async fn set_vm_status(&self, status: ProcessStatus) {
+        self.inner.write().await.set_state(status).await;
+    }
+
+    pub(super) async fn update_vm_pid(&mut self, pid: u32) {
+        self.pid = pid;
+        self.inner.write().await.init_process.pid = pid;
+    }
+
     pub async fn pause(&self) -> Result<()> {
         let mut inner = self.inner.write().await;
         let status = inner.init_process.get_status().await;

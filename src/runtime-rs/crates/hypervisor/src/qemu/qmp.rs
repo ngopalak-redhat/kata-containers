@@ -209,6 +209,13 @@ impl Qmp {
         Ok(migrate_info)
     }
 
+    pub fn cancel_migration(&mut self) -> Result<()> {
+        self.qmp
+            .execute(&qmp::migrate_cancel {})
+            .map(|_| ())
+            .context("cancel migration")
+    }
+
     pub fn execute_migration_incoming(&mut self, uri: &str) -> Result<()> {
         self.qmp
             .execute(&migrate_incoming {

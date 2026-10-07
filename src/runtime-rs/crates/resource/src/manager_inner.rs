@@ -373,6 +373,12 @@ impl ResourceManagerInner {
         Ok(())
     }
 
+    pub async fn setup_after_restore_vm(&self) -> Result<()> {
+        self.cgroups_resource
+            .setup_after_start_vm(self.hypervisor.as_ref())
+            .await
+    }
+
     pub async fn apply_network_to_agent(&self, network: &dyn Network) -> Result<()> {
         self.handle_interfaces(network)
             .await

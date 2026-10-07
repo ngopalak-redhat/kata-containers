@@ -139,6 +139,20 @@ impl VsockDevice {
         self.config.guest_cid = guest_cid;
         Ok(vhost_fd)
     }
+
+    /// Re-open the original CID when restoring the same guest. Allocating a new
+    /// CID would change the device configuration recorded in the checkpoint.
+    pub async fn restore_config(&self) -> Result<File> {
+        anyhow::ensure!(self.config.guest_cid > 2, "invalid saved vsock CID");
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(VHOST_VSOCK_DEVICE)
+            .await?;
+        unsafe { vhost_vsock_set_guest_cid(fd.as_raw_fd(), &(self.config.guest_cid as u64)) }
+            .context("saved vsock CID is unavailable")?;
+        Ok(fd)
+    }
 }
 
 #[async_trait]

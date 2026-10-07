@@ -43,6 +43,13 @@ pub trait AgentManager: Send + Sync {
     async fn start(&self, address: &str) -> Result<()>;
     async fn stop(&self);
     async fn disconnect(&self) -> Result<()>;
+    /// Quiesce host transport while a private VM checkpoint is taken.
+    async fn suspend_transport(&self) -> Result<()> {
+        anyhow::bail!("agent transport suspend is not supported")
+    }
+    async fn resume_transport(&self) -> Result<()> {
+        anyhow::bail!("agent transport resume is not supported")
+    }
 
     async fn agent_sock(&self) -> Result<String>;
     async fn agent_config(&self) -> AgentConfig;

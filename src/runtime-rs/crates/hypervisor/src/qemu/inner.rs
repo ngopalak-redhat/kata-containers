@@ -39,7 +39,14 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    Arc,
+};
 use std::time::Duration;
+
+mod suspend;
+use suspend::SuspendState;
 
 use tokio::time::sleep;
 use tokio::time::Instant;
@@ -67,6 +74,11 @@ pub struct QemuInner {
     netns: Option<String>,
 
     exit_notify: Option<mpsc::Sender<()>>,
+    suspend_state: SuspendState,
+    suspend_hotplug_devices: Vec<DeviceType>,
+    suspend_topology_changed: bool,
+    owns_suspend_directory: bool,
+    retiring: Arc<AtomicBool>,
 }
 
 impl QemuInner {
@@ -80,6 +92,11 @@ impl QemuInner {
             netns: None,
 
             exit_notify: Some(exit_notify),
+            suspend_state: SuspendState::Running,
+            suspend_hotplug_devices: Vec::new(),
+            suspend_topology_changed: false,
+            owns_suspend_directory: false,
+            retiring: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -92,6 +109,9 @@ impl QemuInner {
         info!(sl!(), "Preparing QEMU VM");
         self.id = id.to_string();
         self.netns = netns;
+        if self.config.enable_vm_suspend {
+            self.prepare_suspend_storage()?;
+        }
 
         if !self.hypervisor_config().disable_selinux {
             if let Some(label) = selinux_label.as_ref() {
@@ -136,7 +156,13 @@ impl QemuInner {
                     }
                 }
                 DeviceType::Vsock(vsock_dev) => {
-                    let fd = vsock_dev.init_config().await?;
+                    let fd = if self.config.enable_vm_suspend
+                        && self.config.vm_template.boot_from_template
+                    {
+                        vsock_dev.restore_config().await?
+                    } else {
+                        vsock_dev.init_config().await?
+                    };
                     cmdline.add_vsock(fd, vsock_dev.config.guest_cid)?;
                 }
                 DeviceType::BlockModern(ref block_device) => {
@@ -380,6 +406,10 @@ impl QemuInner {
         info!(sl!(), "qemu args: {}", qemu_args.join(" "));
         let mut command = Command::new(&self.config.path);
         command.args(qemu_args);
+        if self.config.enable_vm_suspend && self.config.vm_template.boot_from_template {
+            // Reapply host cgroups before the container manager sends cont.
+            command.arg("-S");
+        }
         let ccw_subchannel = cmdline.take_ccw_subchannel();
         let block_fdsets = cmdline.take_block_fdsets();
         let has_memory_hotplug_region = cmdline.has_memory_hotplug_region();
@@ -437,10 +467,10 @@ impl QemuInner {
 
         let exit_notify: mpsc::Sender<()> = self
             .exit_notify
-            .take()
+            .clone()
             .ok_or_else(|| anyhow!("no exit notify"))?;
 
-        tokio::spawn(log_qemu_stderr(stderr, exit_notify));
+        tokio::spawn(log_qemu_stderr(stderr, exit_notify, self.retiring.clone()));
 
         // When hypervisor debug is enabled, output the kernel boot messages for debugging.
         if self.config.debug_info.enable_debug {
@@ -501,10 +531,15 @@ impl QemuInner {
 
         // Start the virtual machine by restoring it from a VM template if enabled.
         if self.config.vm_template.boot_from_template {
+            if self.config.enable_vm_suspend {
+                self.replay_suspend_devices().await?;
+            }
             self.boot_from_template()
                 .await
                 .context("boot from template")?;
-            self.resume_vm().context("resume vm")?;
+            if !self.config.enable_vm_suspend {
+                self.resume_vm().context("resume vm")?;
+            }
         }
 
         Ok(())
@@ -516,10 +551,15 @@ impl QemuInner {
             .as_mut()
             .context("failed to get QMP connection for boot from template")?;
 
-        qmp.set_ignore_shared_memory_capability()
-            .context("failed to set ignore shared memory capability")?;
+        if !self.config.enable_vm_suspend {
+            qmp.set_ignore_shared_memory_capability()
+                .context("failed to set ignore shared memory capability")?;
+        }
 
-        let uri = format!("exec:cat {}", self.config.vm_template.device_state_path);
+        let uri = format!(
+            "exec:cat {}",
+            suspend::shell_quote(&self.config.vm_template.device_state_path)
+        );
 
         qmp.execute_migration_incoming(&uri)
             .context("failed to execute migration incoming")?;
@@ -565,10 +605,13 @@ impl QemuInner {
             Err(e) => return Err(e),
         }
 
-        // Overall timeout for migration.
-        // Regarding why the timeout is set to 280ms and whether it should be adjusted, we need more empirical data.
-        // For now, we will keep using the previous configuration.
-        let timeout = Duration::from_millis(280);
+        // Full-RAM suspend needs more time than the existing factory device
+        // checkpoint. Keep the factory's timeout unchanged.
+        let timeout = if self.config.enable_vm_suspend {
+            Duration::from_secs(120)
+        } else {
+            Duration::from_millis(280)
+        };
 
         // Polling interval: start small, then back off to reduce load.
         let poll_interval = Duration::from_millis(20);
@@ -584,7 +627,7 @@ impl QemuInner {
             match migrate_completed(mi.status) {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
-                    info!(sl!(), "migration still not completed, continuing wait loop");
+                    debug!(sl!(), "migration still not completed, continuing wait loop");
                 }
                 Err(e) => return Err(e),
             }
@@ -602,6 +645,14 @@ impl QemuInner {
 
     pub(crate) async fn stop_vm(&mut self) -> Result<()> {
         info!(sl!(), "Stopping QEMU VM");
+
+        if self.suspend_state == SuspendState::Suspended {
+            self.retire_qemu().await?;
+            if let Some(sender) = &self.exit_notify {
+                let _ = sender.try_send(());
+            }
+            return Ok(());
+        }
 
         let mut qemu_process = self.qemu_process.lock().await;
         if let Some(qemu_process) = qemu_process.as_mut() {
@@ -622,6 +673,9 @@ impl QemuInner {
     }
 
     pub(crate) async fn wait_vm(&self) -> Result<i32> {
+        if self.suspend_state == SuspendState::Suspended {
+            return Ok(0);
+        }
         let mut qemu_process = self.qemu_process.lock().await;
 
         if let Some(mut qemu_process) = qemu_process.take() {
@@ -650,7 +704,10 @@ impl QemuInner {
                 .context("failed to set ignore shared memory capability")?;
         }
 
-        let uri = format!("exec:cat >{}", self.config.vm_template.device_state_path);
+        let uri = format!(
+            "exec:cat >{}",
+            suspend::shell_quote(&self.config.vm_template.device_state_path)
+        );
 
         qmp.execute_migration(&uri)
             .context("failed to execute migration")?;
@@ -717,6 +774,9 @@ impl QemuInner {
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
         info!(sl!(), "QemuInner::cleanup()");
+        if self.owns_suspend_directory {
+            self.cleanup_suspend()?;
+        }
         let vm_path = [
             prefix_with_rootless_dir(KATA_PATH).as_str(),
             self.id.as_str(),
@@ -740,6 +800,10 @@ impl QemuInner {
         if new_vcpus == old_vcpus {
             return Ok((old_vcpus, new_vcpus));
         }
+        anyhow::ensure!(
+            !self.config.enable_vm_suspend,
+            "VM suspend requires static CPU sizing"
+        );
 
         if new_vcpus == 0 {
             return Err(anyhow!("resize to 0 vcpus requested"));
@@ -857,6 +921,16 @@ impl QemuInner {
         &mut self,
         mut new_total_mem_mb: u32,
     ) -> Result<(u32, MemoryConfig)> {
+        if self.config.enable_vm_suspend {
+            anyhow::ensure!(
+                new_total_mem_mb <= self.config.memory_info.default_memory,
+                "VM suspend requires static memory sizing"
+            );
+            return Ok((
+                self.config.memory_info.default_memory,
+                MemoryConfig::default(),
+            ));
+        }
         info!(
             sl!(),
             "QemuInner::resize_memory(): asked to resize memory to {} MB", new_total_mem_mb
@@ -1091,7 +1165,11 @@ async fn log_qemu_console(console: UnixStream) -> Result<()> {
     Ok(())
 }
 
-async fn log_qemu_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> Result<()> {
+async fn log_qemu_stderr(
+    stderr: ChildStderr,
+    exit_notify: mpsc::Sender<()>,
+    retiring: Arc<AtomicBool>,
+) -> Result<()> {
     info!(sl!(), "starting reading qemu stderr");
 
     let stderr_reader = BufReader::new(stderr);
@@ -1106,7 +1184,9 @@ async fn log_qemu_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> 
     }
 
     // Notfiy the waiter the process exit.
-    let _ = exit_notify.try_send(());
+    if !retiring.load(AtomicOrdering::SeqCst) {
+        let _ = exit_notify.try_send(());
+    }
 
     info!(sl!(), "finished reading qemu stderr");
     Ok(())
@@ -1120,9 +1200,15 @@ impl QemuInner {
     pub(crate) async fn add_device(&mut self, mut device: DeviceType) -> Result<DeviceType> {
         info!(sl!(), "QemuInner::add_device() {}", device);
         let is_qemu_ready_to_hotplug = self.qmp.is_some();
+        if self.config.enable_vm_suspend {
+            self.validate_suspend_device(&device)?;
+        }
         if is_qemu_ready_to_hotplug {
             // hypervisor is running already
             device = self.hotplug_device(device).await?;
+            if self.config.enable_vm_suspend {
+                self.suspend_hotplug_devices.push(device.clone());
+            }
         } else {
             // store the device to coldplug it later, on hypervisor launch
             self.devices.push(device.clone());
@@ -1133,6 +1219,9 @@ impl QemuInner {
     pub(crate) async fn remove_device(&mut self, device: DeviceType) -> Result<()> {
         info!(sl!(), "QemuInner::remove_device() {} ", device);
         self.hotunplug_device(&device).await?;
+        // Replay in original allocation order is valid until a device is
+        // removed. Reject later checkpoints instead of changing PCI addresses.
+        self.suspend_topology_changed = true;
 
         self.devices.retain(|d| match (d, &device) {
             (DeviceType::BlockModern(a), DeviceType::BlockModern(b)) => {
@@ -1458,6 +1547,11 @@ impl Persist for QemuInner {
             netns: None,
 
             exit_notify: Some(exit_notify),
+            suspend_state: SuspendState::Running,
+            suspend_hotplug_devices: Vec::new(),
+            suspend_topology_changed: false,
+            owns_suspend_directory: false,
+            retiring: Arc::new(AtomicBool::new(false)),
         })
     }
 }

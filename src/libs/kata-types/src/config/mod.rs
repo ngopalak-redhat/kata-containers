@@ -208,7 +208,24 @@ impl TomlConfig {
         Hypervisor::validate(self)?;
         Runtime::validate(self)?;
         Agent::validate(self)?;
+        self.validate_vm_suspend()?;
 
+        Ok(())
+    }
+
+    /// Cross-component requirements for the experimental runtime-rs checkpoint.
+    pub fn validate_vm_suspend(&self) -> Result<()> {
+        for (name, hypervisor) in &self.hypervisor {
+            if hypervisor.enable_vm_suspend
+                && (name != "qemu"
+                    || !self.runtime.static_sandbox_resource_mgmt
+                    || self.runtime.use_passfd_io)
+            {
+                return Err(io::Error::other(
+                    "enable_vm_suspend requires QEMU, static_sandbox_resource_mgmt=true and use_passfd_io=false",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -492,6 +509,25 @@ mod tests {
 
         let patterns = ["/usr/share".to_string(), "/bin/*".to_string()];
         validate_path_pattern(&patterns, "/bin/ls").unwrap();
+    }
+
+    #[test]
+    fn test_vm_suspend_is_opt_in_and_requires_static_qemu() {
+        let mut config = TomlConfig::default();
+        let hv = Hypervisor::default();
+        assert!(!hv.enable_vm_suspend);
+        config.hypervisor.insert("qemu".into(), hv);
+        assert!(config.validate_vm_suspend().is_ok());
+        config.hypervisor.get_mut("qemu").unwrap().enable_vm_suspend = true;
+        assert!(config.validate_vm_suspend().is_err());
+        config.runtime.static_sandbox_resource_mgmt = true;
+        assert!(config.validate_vm_suspend().is_ok());
+        config.runtime.use_passfd_io = true;
+        assert!(config.validate_vm_suspend().is_err());
+        config.runtime.use_passfd_io = false;
+        let hv = config.hypervisor.remove("qemu").unwrap();
+        config.hypervisor.insert("clh".into(), hv);
+        assert!(config.validate_vm_suspend().is_err());
     }
 
     #[test]

@@ -41,6 +41,7 @@ pub struct VirtContainerManager {
     agent: Arc<dyn Agent>,
     hypervisor: Arc<dyn Hypervisor>,
     vmm_master_tid: OnceCell<u32>,
+    last_suspend_vm_pid: RwLock<Option<u32>>,
 }
 
 impl std::fmt::Debug for VirtContainerManager {
@@ -75,10 +76,22 @@ impl VirtContainerManager {
             agent,
             hypervisor,
             vmm_master_tid: OnceCell::new(),
+            last_suspend_vm_pid: RwLock::new(None),
         }
     }
 
     async fn get_vmm_master_tid(&self) -> Result<u32> {
+        if self.hypervisor.hypervisor_config().await.enable_vm_suspend {
+            return match self.hypervisor.get_vmm_master_tid().await {
+                Ok(pid) => {
+                    *self.last_suspend_vm_pid.write().await = Some(pid);
+                    Ok(pid)
+                }
+                // Containerd Connect/Delete still need the last reported PID
+                // while the VM is suspended or after the process was reaped.
+                Err(error) => (*self.last_suspend_vm_pid.read().await).ok_or(error),
+            };
+        }
         self.vmm_master_tid
             .get_or_try_init(|| self.hypervisor.get_vmm_master_tid())
             .await
@@ -90,6 +103,27 @@ impl VirtContainerManager {
 impl ContainerManager for VirtContainerManager {
     #[instrument]
     async fn create_container(&self, config: ContainerConfig, spec: oci::Spec) -> Result<PID> {
+        // Serialize creation against suspend before hooks or device changes.
+        let vm_suspend = self.hypervisor.hypervisor_config().await.enable_vm_suspend;
+        let suspend_guard = if vm_suspend {
+            Some(self.containers.write().await)
+        } else {
+            None
+        };
+        if let Some(containers) = &suspend_guard {
+            self.resource_manager.config().await.validate_vm_suspend()?;
+            anyhow::ensure!(
+                containers.is_empty(),
+                "VM suspend supports only one container per sandbox"
+            );
+            anyhow::ensure!(
+                !config.terminal
+                    && [&config.stdin, &config.stdout, &config.stderr]
+                        .iter()
+                        .all(|s| s.as_deref().unwrap_or_default().is_empty()),
+                "VM suspend requires ctr run --detach --null-io"
+            );
+        }
         let vmm_master_tid = self.get_vmm_master_tid().await?;
 
         let mut container = Container::new(
@@ -128,7 +162,10 @@ impl ContainerManager for VirtContainerManager {
             }
         }
 
-        let mut containers = self.containers.write().await;
+        let mut containers = match suspend_guard {
+            Some(guard) => guard,
+            None => self.containers.write().await,
+        };
         if let Err(e) = container.create(spec).await {
             if let Err(inner_e) = container.cleanup().await {
                 warn!(sl!(), "failed to cleanup container {:?}", inner_e);
@@ -161,6 +198,14 @@ impl ContainerManager for VirtContainerManager {
         match process.process_type {
             ProcessType::Container => {
                 let mut containers = self.containers.write().await;
+                if self.hypervisor.hypervisor_config().await.enable_vm_suspend {
+                    if let Some(c) = containers.get(container_id) {
+                        anyhow::ensure!(
+                            c.vm_status().await != ProcessStatus::Paused,
+                            "resume the VM before deleting the container"
+                        );
+                    }
+                }
                 let c = containers
                     .remove(container_id)
                     .ok_or_else(|| Error::ContainerNotFound(container_id.to_string()))?;
@@ -218,6 +263,12 @@ impl ContainerManager for VirtContainerManager {
         let c = containers
             .get(container_id)
             .ok_or_else(|| Error::ContainerNotFound(container_id.clone()))?;
+        if self.hypervisor.hypervisor_config().await.enable_vm_suspend {
+            anyhow::ensure!(
+                c.vm_status().await == ProcessStatus::Running,
+                "resume the VM before exec"
+            );
+        }
         c.exec_process(
             &req.process,
             req.stdin,
@@ -392,6 +443,44 @@ impl ContainerManager for VirtContainerManager {
 
     #[instrument]
     async fn pause_container(&self, id: &ContainerID) -> Result<()> {
+        if self.hypervisor.hypervisor_config().await.enable_vm_suspend {
+            let start = std::time::Instant::now();
+            let mut containers = self.containers.write().await;
+            anyhow::ensure!(
+                containers.len() == 1,
+                "VM suspend requires exactly one container"
+            );
+            let c = containers
+                .get_mut(&id.container_id)
+                .ok_or_else(|| Error::ContainerNotFound(id.container_id.clone()))?;
+            if c.vm_status().await == ProcessStatus::Paused {
+                return Ok(());
+            }
+            c.validate_vm_suspend().await?;
+            // A cancelled RPC must leave a state in which Resume can recover.
+            c.set_vm_status(ProcessStatus::Paused).await;
+            self.agent.suspend_transport().await?;
+            if let Err(error) = self.hypervisor.suspend_vm().await {
+                // Keep the task resumable if rollback/reconnection fails.
+                c.set_vm_status(ProcessStatus::Paused).await;
+                self.hypervisor.restore_vm().await.with_context(|| {
+                    format!("suspend failed ({error:#}); rollback failed; retry resume")
+                })?;
+                self.resource_manager.setup_after_restore_vm().await?;
+                c.update_vm_pid(self.get_vmm_master_tid().await?).await;
+                self.hypervisor.resume_vm().await?;
+                self.agent
+                    .resume_transport()
+                    .await
+                    .context("reconnect after failed suspend; retry resume")?;
+                c.set_vm_status(ProcessStatus::Running).await;
+                return Err(error);
+            }
+            c.set_vm_status(ProcessStatus::Paused).await;
+            info!(sl!(), "VM suspended"; "sandbox" => &self.sid,
+                "suspend_duration_ms" => start.elapsed().as_millis() as u64);
+            return Ok(());
+        }
         let containers = self.containers.read().await;
         let c = containers
             .get(&id.container_id)
@@ -402,6 +491,28 @@ impl ContainerManager for VirtContainerManager {
 
     #[instrument]
     async fn resume_container(&self, id: &ContainerID) -> Result<()> {
+        if self.hypervisor.hypervisor_config().await.enable_vm_suspend {
+            let start = std::time::Instant::now();
+            let mut containers = self.containers.write().await;
+            let c = containers
+                .get_mut(&id.container_id)
+                .ok_or_else(|| Error::ContainerNotFound(id.container_id.clone()))?;
+            if c.vm_status().await != ProcessStatus::Paused {
+                return Ok(());
+            }
+            self.hypervisor.restore_vm().await?;
+            self.resource_manager.setup_after_restore_vm().await?;
+            c.update_vm_pid(self.get_vmm_master_tid().await?).await;
+            self.hypervisor.resume_vm().await?;
+            self.agent
+                .resume_transport()
+                .await
+                .context("reconnect restored agent; retry resume on failure")?;
+            c.set_vm_status(ProcessStatus::Running).await;
+            info!(sl!(), "VM resumed"; "sandbox" => &self.sid,
+                "resume_duration_ms" => start.elapsed().as_millis() as u64);
+            return Ok(());
+        }
         let containers = self.containers.read().await;
         let c = containers
             .get(&id.container_id)
@@ -436,6 +547,10 @@ impl ContainerManager for VirtContainerManager {
 
     #[instrument]
     async fn update_container(&self, req: UpdateRequest) -> Result<()> {
+        anyhow::ensure!(
+            !self.hypervisor.hypervisor_config().await.enable_vm_suspend,
+            "resource updates are unsupported with VM suspend"
+        );
         let resource = serde_json::from_slice::<oci::LinuxResources>(&req.value)
             .context("deserialize LinuxResource")?;
         let containers = self.containers.read().await;

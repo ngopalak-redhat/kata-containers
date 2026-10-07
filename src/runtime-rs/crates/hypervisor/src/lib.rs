@@ -147,6 +147,14 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn pause_vm(&self) -> Result<()>;
     async fn save_vm(&self) -> Result<()>;
     async fn resume_vm(&self) -> Result<()>;
+    /// Checkpoint the running VM and release its VMM process without sandbox exit.
+    async fn suspend_vm(&self) -> Result<()> {
+        anyhow::bail!("VM suspend is not supported by this hypervisor")
+    }
+    /// Restore a suspended VM; return once the guest is executing again.
+    async fn restore_vm(&self) -> Result<()> {
+        anyhow::bail!("VM restore is not supported by this hypervisor")
+    }
     async fn resize_vcpu(&self, old_vcpus: u32, new_vcpus: u32) -> Result<(u32, u32)>; // returns (old_vcpus, new_vcpus)
     async fn resize_memory(&self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)>;
 

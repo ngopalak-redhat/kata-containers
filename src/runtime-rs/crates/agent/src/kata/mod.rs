@@ -7,11 +7,17 @@
 mod agent;
 mod trans;
 
-use std::{os::unix::io::RawFd, sync::Arc};
+use std::{
+    os::fd::{BorrowedFd, OwnedFd},
+    os::unix::io::RawFd,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use kata_types::config::Agent as AgentConfig;
 use protocols::{agent_ttrpc_async as agent_ttrpc, health_ttrpc_async as health_ttrpc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::watch;
 use tokio::sync::RwLock;
 use ttrpc::asynchronous::Client;
 
@@ -24,12 +30,82 @@ pub struct Vsock {
     pub port: u32,
 }
 
+#[cfg(test)]
+mod suspend_tests {
+    use super::*;
+    use crate::{Agent, AgentManager};
+    use std::os::fd::AsRawFd;
+    use tokio::io::AsyncReadExt;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn suspension_closes_old_transport_and_blocks_waiters() {
+        let agent = Arc::new(KataAgent::new(AgentConfig::default()));
+        let (stream, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let fd = stream.as_raw_fd();
+        {
+            let mut inner = agent.inner.write().await;
+            inner.client_fd = fd;
+            inner.client_shutdown_fd = Some(
+                unsafe { BorrowedFd::borrow_raw(fd) }
+                    .try_clone_to_owned()
+                    .unwrap(),
+            );
+            inner.client = Some(Client::new(stream.into()));
+        }
+        let epoch = agent.transport_epoch.load(Ordering::SeqCst);
+        agent.suspend_transport().await.unwrap();
+        assert!(agent.transport_changed(epoch));
+        let mut byte = [0];
+        assert_eq!(
+            timeout(Duration::from_secs(1), peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(timeout(Duration::from_millis(20), agent.wait_connected())
+            .await
+            .is_err());
+        // A failed reconnect must keep health/WaitProcess parked.
+        assert!(agent.resume_transport().await.is_err());
+        assert!(*agent.suspended.borrow());
+        agent.suspended.send_replace(false);
+        timeout(Duration::from_secs(1), agent.wait_connected())
+            .await
+            .unwrap()
+            .unwrap();
+        // An old request must still notice a whole suspend/resume cycle.
+        assert!(agent.transport_changed(epoch));
+    }
+
+    #[tokio::test]
+    async fn suspended_mutating_rpc_fails_without_waiting_for_resume() {
+        let agent = KataAgent::new(AgentConfig::default());
+        agent.suspend_transport().await.unwrap();
+        let result = timeout(
+            Duration::from_secs(1),
+            agent.pause_container(crate::ContainerID::new("c")),
+        )
+        .await
+        .unwrap();
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("VM is suspended"));
+    }
+}
+
 pub(crate) struct KataAgentInner {
     /// TTRPC client
     pub client: Option<Client>,
 
     /// Client fd
     pub client_fd: RawFd,
+    // Own a duplicate so a closed/reused raw fd can never be shut down by
+    // suspend_transport. The ttrpc receive task owns the original descriptor.
+    client_shutdown_fd: Option<OwnedFd>,
 
     /// Unix domain socket address
     pub socket_address: String,
@@ -56,19 +132,42 @@ unsafe impl Sync for KataAgent {}
 #[derive(Debug)]
 pub struct KataAgent {
     pub(crate) inner: Arc<RwLock<KataAgentInner>>,
+    pub(crate) suspended: watch::Sender<bool>,
+    pub(crate) transport_epoch: AtomicU64,
 }
 
 impl KataAgent {
     pub fn new(config: AgentConfig) -> Self {
         KataAgent {
+            suspended: watch::channel(false).0,
+            transport_epoch: AtomicU64::new(0),
             inner: Arc::new(RwLock::new(KataAgentInner {
                 client: None,
                 client_fd: -1,
+                client_shutdown_fd: None,
                 socket_address: "".to_string(),
                 config,
                 log_forwarder: LogForwarder::new(),
             })),
         }
+    }
+
+    pub(crate) async fn wait_connected(&self) -> Result<()> {
+        let mut state = self.suspended.subscribe();
+        while {
+            let paused = *state.borrow_and_update();
+            paused
+        } {
+            state
+                .changed()
+                .await
+                .context("agent suspend channel closed")?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn transport_changed(&self, epoch: u64) -> bool {
+        self.transport_epoch.load(Ordering::SeqCst) != epoch || *self.suspended.borrow()
     }
 
     pub async fn get_health_client(&self) -> Option<(health_ttrpc::HealthClient, i64, RawFd)> {
@@ -111,6 +210,7 @@ impl KataAgent {
         info!(sl!(), "try to connect agent server through {:?}", sock);
         let stream = sock.connect(&config).await.context("connect")?;
         let client_fd = stream.raw_fd();
+        let shutdown_fd = unsafe { BorrowedFd::borrow_raw(client_fd) }.try_clone_to_owned()?;
         info!(
             sl!(),
             "get stream raw fd {:?} with socket address: {:?} and server_port {:?}",
@@ -121,6 +221,7 @@ impl KataAgent {
         let c = Client::new(stream.into_ttrpc_socket());
         inner.client = Some(c);
         inner.client_fd = client_fd;
+        inner.client_shutdown_fd = Some(shutdown_fd);
         Ok(())
     }
 
@@ -166,6 +267,7 @@ impl KataAgent {
 
         // If there is a valid client, drop it (closes the connection).
         inner.client.take();
+        inner.client_shutdown_fd.take();
         inner.client_fd = -1;
 
         Ok(())

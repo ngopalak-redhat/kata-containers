@@ -90,6 +90,11 @@ impl ResourceManager {
         inner.setup_after_start_vm().await
     }
 
+    /// Reattach a restored QEMU's new PID/threads without recreating devices.
+    pub async fn setup_after_restore_vm(&self) -> Result<()> {
+        self.inner.read().await.setup_after_restore_vm().await
+    }
+
     /// Poll the netns until interfaces exist, then configure the guest (Docker 26+).
     ///
     /// The polling phase uses a lightweight netlink scan (no endpoint creation,

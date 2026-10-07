@@ -6,6 +6,9 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use nix::libc;
+use std::os::fd::AsRawFd;
+use std::sync::atomic::Ordering;
 use tracing::instrument;
 use ttrpc::context as ttrpc_ctx;
 
@@ -53,6 +56,30 @@ impl AgentManager for KataAgent {
     async fn disconnect(&self) -> Result<()> {
         self.disconnect().await.context("disconnect agent")
     }
+
+    async fn suspend_transport(&self) -> Result<()> {
+        self.suspended.send_replace(true);
+        self.transport_epoch.fetch_add(1, Ordering::SeqCst);
+        let mut inner = self.inner.write().await;
+        inner.log_forwarder.stop();
+        // Pending WaitProcess RPCs hold cloned clients. Dropping inner.client
+        // alone does not close their socket; shutdown wakes them for retry.
+        if let Some(fd) = inner.client_shutdown_fd.take() {
+            unsafe {
+                libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR);
+            }
+        }
+        inner.client.take();
+        inner.client_fd = -1;
+        Ok(())
+    }
+
+    async fn resume_transport(&self) -> Result<()> {
+        self.connect_agent_server().await?;
+        self.start_log_forwarder().await?;
+        self.suspended.send_replace(false);
+        Ok(())
+    }
 }
 
 // implement for health service
@@ -62,9 +89,18 @@ macro_rules! impl_health_service {
         impl HealthService for KataAgent {
             $(async fn $name(&self, req: $req) -> Result<$resp> {
                 let r = req.into();
-                let (client, timeout, _) = self.get_health_client().await.context("get health client")?;
-                let resp = client.$name(new_ttrpc_ctx(timeout * MILLISECOND_TO_NANOSECOND), &r).await?;
-                Ok(resp.into())
+                loop {
+                    self.wait_connected().await?;
+                    let epoch = self.transport_epoch.load(Ordering::SeqCst);
+                    let Some((client, timeout, _)) = self.get_health_client().await else {
+                        if self.transport_changed(epoch) { continue; }
+                        anyhow::bail!("get health client");
+                    };
+                    match client.$name(new_ttrpc_ctx(timeout * MILLISECOND_TO_NANOSECOND), &r).await {
+                        Err(_) if self.transport_changed(epoch) => continue,
+                        result => return Ok(result?.into()),
+                    }
+                }
             })*
         }
     };
@@ -82,15 +118,32 @@ macro_rules! impl_agent {
             #[instrument(skip(req))]
             $(async fn $name(&self, req: $req) -> Result<$resp> {
                 let r = req.into();
-                let (client, mut timeout, _) = self.get_agent_client().await.context("get client")?;
+                loop {
+                // Reconnect long-lived subscriptions only. Replaying a mutating
+                // RPC or byte stream after a lost reply can duplicate effects.
+                // OOM notifications remain best effort across a disconnect.
+                let retryable = matches!(stringify!($name), "wait_process" | "get_oom_event");
+                if retryable {
+                    self.wait_connected().await?;
+                } else if *self.suspended.borrow() {
+                    anyhow::bail!("VM is suspended; resume it before issuing agent requests");
+                }
+                let epoch = self.transport_epoch.load(Ordering::SeqCst);
+                let Some((client, mut timeout, _)) = self.get_agent_client().await else {
+                    if retryable && self.transport_changed(epoch) { continue; }
+                    anyhow::bail!("get client");
+                };
 
                 // update new timeout
                 if let Some(v) = $new_timeout {
                     timeout = v;
                 }
 
-                let resp = client.$name(new_ttrpc_ctx(timeout * MILLISECOND_TO_NANOSECOND), &r).await?;
-                Ok(resp.into())
+                match client.$name(new_ttrpc_ctx(timeout * MILLISECOND_TO_NANOSECOND), &r).await {
+                    Err(_) if retryable && self.transport_changed(epoch) => continue,
+                    result => return Ok(result?.into()),
+                }
+                }
             })*
         }
     };

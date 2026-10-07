@@ -1695,6 +1695,15 @@ pub struct Factory {
 /// Common configuration information for hypervisors.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Hypervisor {
+    /// Experimental containerd pause/resume using a private QEMU VM checkpoint.
+    /// Only supported by runtime-rs QEMU for a single, detached container.
+    #[serde(default)]
+    pub enable_vm_suspend: bool,
+
+    /// Disk-backed directory for private suspend checkpoints (not the VM factory).
+    #[serde(default)]
+    pub vm_suspend_path: String,
+
     /// Path to the hypervisor executable.
     #[serde(default)]
     pub path: String,
